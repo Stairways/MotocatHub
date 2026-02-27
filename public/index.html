@@ -182,6 +182,7 @@ nav{position:sticky;top:0;z-index:100;background:rgba(7,5,15,.94);backdrop-filte
 /* ── HERO ── */
 .hero{text-align:center;padding:3.5rem 1rem 2rem;animation:fadeUp .7s ease both}
 @keyframes fadeUp{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
 .hero h1{font-family:'Bebas Neue',sans-serif;font-size:clamp(3rem,9vw,6rem);letter-spacing:.06em;line-height:1;
   background:linear-gradient(135deg,#fff 0%,var(--gold) 45%,var(--orange) 100%);
   -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
@@ -668,46 +669,233 @@ let btcData = null;
 let btcRange = '1';
 
 // ═══════════════════════════════════════════
-// WALLET
+// WALLET — multi-wallet modal
 // ═══════════════════════════════════════════
-async function connectWallet() {
-  const btn = document.getElementById('connectBtn');
 
+// Wallet definitions: provider detection + connect method
+const WALLETS = [
+  {
+    id: 'opwallet',
+    name: 'OP_WALLET',
+    desc: 'Official OP_NET wallet',
+    icon: '₿',
+    detect: () => !!(window.opnet || window.bitcoin),
+    connect: async () => {
+      if (window.opnet)  return (await window.opnet.requestAccounts())[0];
+      if (window.bitcoin) return (await window.bitcoin.requestAccounts())[0];
+    },
+  },
+  {
+    id: 'unisat',
+    name: 'UniSat',
+    desc: 'Bitcoin Ordinals wallet',
+    icon: '🟠',
+    detect: () => !!window.unisat,
+    connect: async () => (await window.unisat.requestAccounts())[0],
+  },
+  {
+    id: 'xverse',
+    name: 'Xverse',
+    desc: 'Bitcoin & Ordinals wallet',
+    icon: '✦',
+    detect: () => !!(window.XverseProviders?.BitcoinProvider || window.xverse || window.BitcoinProvider),
+    connect: async () => {
+      // Xverse uses getAddresses via sats-connect pattern
+      const provider = window.XverseProviders?.BitcoinProvider || window.BitcoinProvider;
+      if (provider && provider.connect) {
+        const resp = await provider.connect({ purposes: ['ordinals', 'payment'] });
+        return resp?.addresses?.find(a => a.purpose === 'ordinals')?.address
+            || resp?.addresses?.[0]?.address;
+      }
+      // Fallback: some versions inject window.xverse
+      if (window.xverse) {
+        const resp = await window.xverse.request('getAddresses', { purposes: ['ordinals'] });
+        return resp?.result?.addresses?.[0]?.address;
+      }
+      throw new Error('Xverse detected but could not connect. Please try from within the Xverse extension.');
+    },
+  },
+  {
+    id: 'leather',
+    name: 'Leather',
+    desc: 'Formerly Hiro Wallet',
+    icon: '🟤',
+    detect: () => !!window.LeatherProvider,
+    connect: async () => {
+      const resp = await window.LeatherProvider.request('getAddresses', null);
+      // Leather returns multiple addresses — prefer taproot (bc1p) for Ordinals
+      const addrs = resp?.result?.addresses || [];
+      return addrs.find(a => a.type === 'p2tr')?.address
+          || addrs.find(a => a.address?.startsWith('bc1p'))?.address
+          || addrs[0]?.address;
+    },
+  },
+  {
+    id: 'magiceden',
+    name: 'Magic Eden',
+    desc: 'ME Wallet · Ordinals native',
+    icon: '🎨',
+    detect: () => !!(window.magicEden?.bitcoin || window.magiceden),
+    connect: async () => {
+      const provider = window.magicEden?.bitcoin || window.magiceden;
+      const accounts = await provider.requestAccounts();
+      return accounts[0];
+    },
+  },
+  {
+    id: 'okx',
+    name: 'OKX Wallet',
+    desc: 'Multi-chain · Ordinals support',
+    icon: '⭕',
+    detect: () => !!(window.okxwallet?.bitcoin || window.okxwallet),
+    connect: async () => {
+      const provider = window.okxwallet?.bitcoin || window.okxwallet;
+      const accounts = await provider.requestAccounts();
+      return accounts[0] || accounts?.address;
+    },
+  },
+  {
+    id: 'phantom',
+    name: 'Phantom',
+    desc: 'Multi-chain · Bitcoin support',
+    icon: '👻',
+    detect: () => !!(window.phantom?.bitcoin),
+    connect: async () => {
+      const resp = await window.phantom.bitcoin.requestAccounts();
+      return resp[0]?.address || resp[0];
+    },
+  },
+];
+
+function connectWallet() {
   if (walletAddress) {
-    // Disconnect
-    walletAddress = null;
-    btn.textContent = '⚡ Connect Wallet';
-    btn.className = 'btn';
-    showNFTState('disconnected');
+    disconnectWallet(); return;
+  }
+  openWalletModal();
+}
+
+function disconnectWallet() {
+  walletAddress = null;
+  const btn = document.getElementById('connectBtn');
+  btn.textContent = '⚡ Connect Wallet';
+  btn.className = 'btn';
+  showNFTState('disconnected');
+  showToast('Wallet disconnected');
+}
+
+function openWalletModal() {
+  let modal = document.getElementById('walletModal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'walletModal';
+    modal.style.cssText = `
+      position:fixed;inset:0;background:rgba(0,0,0,.85);backdrop-filter:blur(8px);
+      z-index:1000;display:flex;align-items:center;justify-content:center;
+      animation:fadeIn .2s ease both;
+    `;
+    modal.innerHTML = `
+      <div style="
+        background:#0e0b1a;border:1px solid #2a1f45;padding:2rem;
+        width:100%;max-width:420px;position:relative;
+        animation:fadeUp .25s ease both;
+      ">
+        <div style="position:absolute;top:0;left:0;right:0;height:2px;
+          background:linear-gradient(90deg,#7c3aed,#f97316,transparent)"></div>
+        <button onclick="closeWalletModal()" style="
+          position:absolute;top:.9rem;right:1rem;background:none;border:none;
+          color:#7a6e8a;font-size:1.1rem;cursor:pointer;line-height:1;
+        ">✕</button>
+        <div style="font-family:'Bebas Neue',sans-serif;font-size:1.4rem;
+          letter-spacing:.1em;color:#f59e0b;margin-bottom:.2rem">Connect Wallet</div>
+        <div style="font-size:.62rem;color:#7a6e8a;margin-bottom:1.4rem;letter-spacing:.04em">
+          Choose your Bitcoin Ordinals wallet to view your Motocats
+        </div>
+        <div id="walletList"></div>
+        <div style="margin-top:1.2rem;padding-top:.8rem;border-top:1px solid #2a1f45;
+          font-size:.58rem;color:#7a6e8a;text-align:center;line-height:1.7">
+          No wallet installed? Get
+          <a href="https://unisat.io" target="_blank" style="color:#a78bfa">UniSat</a> ·
+          <a href="https://www.xverse.app" target="_blank" style="color:#a78bfa">Xverse</a> ·
+          <a href="https://leather.io" target="_blank" style="color:#a78bfa">Leather</a>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    modal.addEventListener('click', e => { if (e.target === modal) closeWalletModal(); });
+  }
+
+  // Render wallet list with installed badges
+  const list = modal.querySelector('#walletList');
+  list.innerHTML = WALLETS.map(w => {
+    const installed = w.detect();
+    return `
+      <button onclick="selectWallet('${w.id}')" style="
+        width:100%;background:#130f22;border:1px solid ${installed ? '#2a1f45' : '#1a1428'};
+        color:${installed ? '#e8ddd0' : '#7a6e8a'};
+        font-family:'Space Mono',monospace;font-size:.68rem;
+        padding:.75rem 1rem;cursor:pointer;transition:all .2s;
+        display:flex;align-items:center;gap:.9rem;margin-bottom:.4rem;
+        text-align:left;position:relative;
+      " onmouseover="this.style.borderColor='#f97316';this.style.color='#e8ddd0'"
+         onmouseout="this.style.borderColor='${installed ? '#2a1f45' : '#1a1428'}';this.style.color='${installed ? '#e8ddd0' : '#7a6e8a'}'">
+        <span style="font-size:1.4rem;width:32px;text-align:center;flex-shrink:0">${w.icon}</span>
+        <span style="flex:1">
+          <span style="display:block;font-weight:700;letter-spacing:.06em">${w.name}</span>
+          <span style="font-size:.58rem;color:#7a6e8a">${w.desc}</span>
+        </span>
+        ${installed
+          ? `<span style="font-size:.55rem;letter-spacing:.12em;text-transform:uppercase;
+               padding:2px 8px;border:1px solid #22c55e;color:#22c55e">Detected</span>`
+          : `<span style="font-size:.55rem;letter-spacing:.12em;text-transform:uppercase;
+               padding:2px 8px;border:1px solid #2a1f45;color:#7a6e8a">Install</span>`}
+      </button>`;
+  }).join('');
+
+  modal.style.display = 'flex';
+}
+
+function closeWalletModal() {
+  const modal = document.getElementById('walletModal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function selectWallet(id) {
+  const w = WALLETS.find(x => x.id === id);
+  if (!w) return;
+
+  // If not installed, open install page
+  if (!w.detect()) {
+    const links = {
+      unisat:    'https://unisat.io',
+      xverse:    'https://www.xverse.app/download',
+      leather:   'https://leather.io',
+      magiceden: 'https://wallet.magiceden.io',
+      okx:       'https://www.okx.com/web3',
+      phantom:   'https://phantom.app',
+      opwallet:  'https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb',
+    };
+    window.open(links[id] || '#', '_blank');
+    showToast(`↗ Opening ${w.name} install page`);
     return;
   }
 
-  try {
-    // Try OP_WALLET first
-    if (window.opnet) {
-      const accounts = await window.opnet.requestAccounts();
-      walletAddress = accounts[0];
-    } else if (window.bitcoin) {
-      const accounts = await window.bitcoin.requestAccounts();
-      walletAddress = accounts[0];
-    } else if (window.unisat) {
-      const accounts = await window.unisat.requestAccounts();
-      walletAddress = accounts[0];
-    } else {
-      // Demo mode — use a real-looking Taproot address for UI purposes
-      walletAddress = 'bc1pdemo000000000000000000000000000000000000000000000demo';
-      showToast('⚠ No wallet found — running in demo mode');
-    }
+  closeWalletModal();
+  const btn = document.getElementById('connectBtn');
+  btn.textContent = 'Connecting…';
 
-    const short = walletAddress.slice(0, 8) + '…' + walletAddress.slice(-5);
+  try {
+    walletAddress = await w.connect();
+    if (!walletAddress) throw new Error('No address returned');
+
+    const short = walletAddress.slice(0, 7) + '…' + walletAddress.slice(-5);
     btn.textContent = short;
     btn.className = 'btn connected';
-
-    // Fetch Motocats
+    showToast(`✓ ${w.name} connected`);
     fetchMotocats(walletAddress);
 
   } catch (err) {
-    showToast('⚠ ' + (err.message || 'Connection failed'));
+    btn.textContent = '⚡ Connect Wallet';
+    btn.className = 'btn';
+    showToast('⚠ ' + (err.message || `${w.name} connection failed`));
   }
 }
 
